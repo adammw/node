@@ -52,6 +52,27 @@ exports.indirectInstanceOf = function(obj, cls) {
 };
 
 
+exports.ddCommand = function(filename, kilobytes) {
+  if (process.platform == 'win32') {
+    return '"' + process.argv[0] + '" "' + path.resolve(exports.fixturesDir,
+      'create-file.js') + '" "' + filename + '" ' + (kilobytes * 1024);
+  } else {
+    return 'dd if=/dev/zero of="' + filename + '" bs=1024 count=' + kilobytes;
+  }
+};
+
+
+exports.spawnPwd = function(options) {
+  var spawn = require('child_process').spawn;
+
+  if (process.platform == 'win32') {
+    return spawn('cmd.exe', ['/c', 'cd'], options);
+  } else {
+    return spawn('pwd', [], options);
+  }
+};
+
+
 // Turn this off if the test should not check for global leaks.
 exports.globalCheck = true;
 
@@ -85,6 +106,19 @@ process.on('exit', function() {
     knownGlobals.push(DTRACE_NET_SOCKET_WRITE);
   }
 
+  if (global.ArrayBuffer) {
+    knownGlobals.push(ArrayBuffer);
+    knownGlobals.push(Int8Array);
+    knownGlobals.push(Uint8Array);
+    knownGlobals.push(Int16Array);
+    knownGlobals.push(Uint16Array);
+    knownGlobals.push(Int32Array);
+    knownGlobals.push(Uint32Array);
+    knownGlobals.push(Float32Array);
+    knownGlobals.push(Float64Array);
+    knownGlobals.push(DataView);
+  }
+
   for (var x in global) {
     var found = false;
 
@@ -97,7 +131,7 @@ process.on('exit', function() {
 
     if (!found) {
       console.error('Unknown global: %s', x);
-      assert.ok(false, 'Unknown global founded');
+      assert.ok(false, 'Unknown global found');
     }
   }
 });

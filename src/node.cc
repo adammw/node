@@ -24,33 +24,45 @@
 #include <uv.h>
 
 #include <v8-debug.h>
-#include <node_dtrace.h>
+#ifdef HAVE_DTRACE
+# include <node_dtrace.h>
+#endif
 
 #include <locale.h>
 #include <signal.h>
 #include <stdio.h>
+#if defined(_MSC_VER)
+#define snprintf _snprintf
+#endif
 #include <stdlib.h>
-#include <strings.h>
 #include <string.h>
+#if !defined(_MSC_VER)
+#include <strings.h>
+#else
+#define strcasecmp _stricmp
+#endif
 #include <limits.h> /* PATH_MAX */
 #include <assert.h>
-#include <unistd.h>
+#if !defined(_MSC_VER)
+#include <unistd.h> /* setuid, getuid */
+#else
+#include <direct.h>
+#define chdir _chdir
+#define getcwd _getcwd
+#include <process.h>
+#define getpid _getpid
+#include <io.h>
+#define umask _umask
+typedef int mode_t;
+#endif
 #include <errno.h>
 #include <sys/types.h>
-#include <unistd.h> /* setuid, getuid */
 
-#ifdef __MINGW32__
+#if defined(__MINGW32__) || defined(_MSC_VER)
 # include <platform_win32.h> /* winapi_perror() */
-# ifdef PTW32_STATIC_LIB
-extern "C" {
-  BOOL __cdecl pthread_win32_process_attach_np (void);
-  BOOL __cdecl pthread_win32_process_detach_np (void);
-}
-# endif
 #endif
 
 #ifdef __POSIX__
-# include <dlfcn.h> /* dlopen(), dlsym() */
 # include <pwd.h> /* getpwnam() */
 # include <grp.h> /* getgrnam() */
 #endif
@@ -60,34 +72,28 @@ extern "C" {
 #ifdef __POSIX__
 # include <node_io_watcher.h>
 #endif
-#include <node_net.h>
-#include <node_cares.h>
 #include <node_file.h>
 #include <node_http_parser.h>
 #ifdef __POSIX__
 # include <node_signal_watcher.h>
 # include <node_stat_watcher.h>
-# include <node_timer.h>
 #endif
-#include <node_child_process.h>
 #include <node_constants.h>
-#include <node_stdio.h>
 #include <node_javascript.h>
 #include <node_version.h>
 #include <node_string.h>
-#ifdef HAVE_OPENSSL
+#if HAVE_OPENSSL
 # include <node_crypto.h>
 #endif
 #include <node_script.h>
-
-#define ARRAY_SIZE(a) (sizeof(a) / sizeof(*(a)))
+#include <v8_typed_array.h>
 
 using namespace v8;
 
 # ifdef __APPLE__
 # include <crt_externs.h>
 # define environ (*_NSGetEnviron())
-# else
+# elif !defined(_MSC_VER)
 extern char **environ;
 # endif
 
@@ -101,7 +107,6 @@ static Persistent<String> errpath_symbol;
 static Persistent<String> code_symbol;
 
 static Persistent<String> rss_symbol;
-static Persistent<String> vsize_symbol;
 static Persistent<String> heap_total_symbol;
 static Persistent<String> heap_used_symbol;
 
@@ -123,23 +128,6 @@ static uv_idle_t tick_spinner;
 static bool need_tick_cb;
 static Persistent<String> tick_callback_sym;
 
-static uv_async_t eio_want_poll_notifier;
-static uv_async_t eio_done_poll_notifier;
-static uv_idle_t eio_poller;
-
-
-// XXX use_uv defaults to false on POSIX platforms and to true on Windows
-// platforms. This can be set with "--use-uv" command-line flag. We intend
-// to remove the legacy backend once the libuv backend is passing all of the
-// tests.
-#ifdef __POSIX__
-static bool use_uv = false;
-#else
-static bool use_uv = true;
-#endif
-
-// disabled by default for now
-static bool use_http1 = false;
 
 #ifdef OPENSSL_NPN_NEGOTIATED
 static bool use_npn = true;
@@ -181,7 +169,7 @@ static void CheckStatus(uv_timer_t* watcher, int status);
 
 static void StartGCTimer () {
   if (!uv_is_active((uv_handle_t*) &gc_timer)) {
-    uv_timer_start(&node::gc_timer, node::CheckStatus, 5000., 5000.);
+    uv_timer_start(&node::gc_timer, node::CheckStatus, 5000, 5000);
   }
 }
 
@@ -205,7 +193,7 @@ static void Idle(uv_idle_t* watcher, int status) {
 static void Check(uv_check_t* watcher, int status) {
   assert(watcher == &gc_check);
 
-  tick_times[tick_time_head] = uv_now();
+  tick_times[tick_time_head] = uv_now(uv_default_loop());
   tick_time_head = (tick_time_head + 1) % RPM_SAMPLES;
 
   StartGCTimer();
@@ -235,7 +223,7 @@ static void Tick(void) {
   need_tick_cb = false;
   if (uv_is_active((uv_handle_t*) &tick_spinner)) {
     uv_idle_stop(&tick_spinner);
-    uv_unref();
+    uv_unref(uv_default_loop());
   }
 
   HandleScope scope;
@@ -277,7 +265,7 @@ static Handle<Value> NeedTickCallback(const Arguments& args) {
   // tick_spinner to keep the event loop alive long enough to handle it.
   if (!uv_is_active((uv_handle_t*) &tick_spinner)) {
     uv_idle_start(&tick_spinner, Spin);
-    uv_ref();
+    uv_ref(uv_default_loop());
   }
   return Undefined();
 }
@@ -295,62 +283,6 @@ static void CheckTick(uv_check_t* handle, int status) {
   assert(status == 0);
   Tick();
 }
-
-
-static void DoPoll(uv_idle_t* watcher, int status) {
-  assert(watcher == &eio_poller);
-
-  //printf("eio_poller\n");
-
-  if (eio_poll() != -1 && uv_is_active((uv_handle_t*) &eio_poller)) {
-    //printf("eio_poller stop\n");
-    uv_idle_stop(&eio_poller);
-    uv_unref();
-  }
-}
-
-
-// Called from the main thread.
-static void WantPollNotifier(uv_async_t* watcher, int status) {
-  assert(watcher == &eio_want_poll_notifier);
-
-  //printf("want poll notifier\n");
-
-  if (eio_poll() == -1 && !uv_is_active((uv_handle_t*) &eio_poller)) {
-    //printf("eio_poller start\n");
-    uv_idle_start(&eio_poller, node::DoPoll);
-    uv_ref();
-  }
-}
-
-
-static void DonePollNotifier(uv_async_t* watcher, int revents) {
-  assert(watcher == &eio_done_poll_notifier);
-
-  //printf("done poll notifier\n");
-
-  if (eio_poll() != -1 && uv_is_active((uv_handle_t*) &eio_poller)) {
-    //printf("eio_poller stop\n");
-    uv_idle_stop(&eio_poller);
-    uv_unref();
-  }
-}
-
-
-// EIOWantPoll() is called from the EIO thread pool each time an EIO
-// request (that is, one of the node.fs.* functions) has completed.
-static void EIOWantPoll(void) {
-  // Signal the main thread that eio_poll need to be processed.
-  uv_async_send(&eio_want_poll_notifier);
-}
-
-
-static void EIODonePoll(void) {
-  // Signal the main thread that we should stop calling eio_poll().
-  // from the idle watcher.
-  uv_async_send(&eio_done_poll_notifier);
-}
-
 
 static inline const char *errno_string(int errorno) {
 #define ERRNO_CASE(e)  case e: return #e;
@@ -673,234 +605,6 @@ static inline const char *errno_string(int errorno) {
   ERRNO_CASE(EXDEV);
 #endif
 
-#ifdef WSAEINTR
-  ERRNO_CASE(WSAEINTR);
-#endif
-
-#ifdef WSAEBADF
-  ERRNO_CASE(WSAEBADF);
-#endif
-
-#ifdef WSAEACCES
-  ERRNO_CASE(WSAEACCES);
-#endif
-
-#ifdef WSAEFAULT
-  ERRNO_CASE(WSAEFAULT);
-#endif
-
-#ifdef WSAEINVAL
-  ERRNO_CASE(WSAEINVAL);
-#endif
-
-#ifdef WSAEMFILE
-  ERRNO_CASE(WSAEMFILE);
-#endif
-
-#ifdef WSAEWOULDBLOCK
-  ERRNO_CASE(WSAEWOULDBLOCK);
-#endif
-
-#ifdef WSAEINPROGRESS
-  ERRNO_CASE(WSAEINPROGRESS);
-#endif
-
-#ifdef WSAEALREADY
-  ERRNO_CASE(WSAEALREADY);
-#endif
-
-#ifdef WSAENOTSOCK
-  ERRNO_CASE(WSAENOTSOCK);
-#endif
-
-#ifdef WSAEDESTADDRREQ
-  ERRNO_CASE(WSAEDESTADDRREQ);
-#endif
-
-#ifdef WSAEMSGSIZE
-  ERRNO_CASE(WSAEMSGSIZE);
-#endif
-
-#ifdef WSAEPROTOTYPE
-  ERRNO_CASE(WSAEPROTOTYPE);
-#endif
-
-#ifdef WSAENOPROTOOPT
-  ERRNO_CASE(WSAENOPROTOOPT);
-#endif
-
-#ifdef WSAEPROTONOSUPPORT
-  ERRNO_CASE(WSAEPROTONOSUPPORT);
-#endif
-
-#ifdef WSAESOCKTNOSUPPORT
-  ERRNO_CASE(WSAESOCKTNOSUPPORT);
-#endif
-
-#ifdef WSAEOPNOTSUPP
-  ERRNO_CASE(WSAEOPNOTSUPP);
-#endif
-
-#ifdef WSAEPFNOSUPPORT
-  ERRNO_CASE(WSAEPFNOSUPPORT);
-#endif
-
-#ifdef WSAEAFNOSUPPORT
-  ERRNO_CASE(WSAEAFNOSUPPORT);
-#endif
-
-#ifdef WSAEADDRINUSE
-  ERRNO_CASE(WSAEADDRINUSE);
-#endif
-
-#ifdef WSAEADDRNOTAVAIL
-  ERRNO_CASE(WSAEADDRNOTAVAIL);
-#endif
-
-#ifdef WSAENETDOWN
-  ERRNO_CASE(WSAENETDOWN);
-#endif
-
-#ifdef WSAENETUNREACH
-  ERRNO_CASE(WSAENETUNREACH);
-#endif
-
-#ifdef WSAENETRESET
-  ERRNO_CASE(WSAENETRESET);
-#endif
-
-#ifdef WSAECONNABORTED
-  ERRNO_CASE(WSAECONNABORTED);
-#endif
-
-#ifdef WSAECONNRESET
-  ERRNO_CASE(WSAECONNRESET);
-#endif
-
-#ifdef WSAENOBUFS
-  ERRNO_CASE(WSAENOBUFS);
-#endif
-
-#ifdef WSAEISCONN
-  ERRNO_CASE(WSAEISCONN);
-#endif
-
-#ifdef WSAENOTCONN
-  ERRNO_CASE(WSAENOTCONN);
-#endif
-
-#ifdef WSAESHUTDOWN
-  ERRNO_CASE(WSAESHUTDOWN);
-#endif
-
-#ifdef WSAETOOMANYREFS
-  ERRNO_CASE(WSAETOOMANYREFS);
-#endif
-
-#ifdef WSAETIMEDOUT
-  ERRNO_CASE(WSAETIMEDOUT);
-#endif
-
-#ifdef WSAECONNREFUSED
-  ERRNO_CASE(WSAECONNREFUSED);
-#endif
-
-#ifdef WSAELOOP
-  ERRNO_CASE(WSAELOOP);
-#endif
-
-#ifdef WSAENAMETOOLONG
-  ERRNO_CASE(WSAENAMETOOLONG);
-#endif
-
-#ifdef WSAEHOSTDOWN
-  ERRNO_CASE(WSAEHOSTDOWN);
-#endif
-
-#ifdef WSAEHOSTUNREACH
-  ERRNO_CASE(WSAEHOSTUNREACH);
-#endif
-
-#ifdef WSAENOTEMPTY
-  ERRNO_CASE(WSAENOTEMPTY);
-#endif
-
-#ifdef WSAEPROCLIM
-  ERRNO_CASE(WSAEPROCLIM);
-#endif
-
-#ifdef WSAEUSERS
-  ERRNO_CASE(WSAEUSERS);
-#endif
-
-#ifdef WSAEDQUOT
-  ERRNO_CASE(WSAEDQUOT);
-#endif
-
-#ifdef WSAESTALE
-  ERRNO_CASE(WSAESTALE);
-#endif
-
-#ifdef WSAEREMOTE
-  ERRNO_CASE(WSAEREMOTE);
-#endif
-
-#ifdef WSASYSNOTREADY
-  ERRNO_CASE(WSASYSNOTREADY);
-#endif
-
-#ifdef WSAVERNOTSUPPORTED
-  ERRNO_CASE(WSAVERNOTSUPPORTED);
-#endif
-
-#ifdef WSANOTINITIALISED
-  ERRNO_CASE(WSANOTINITIALISED);
-#endif
-
-#ifdef WSAEDISCON
-  ERRNO_CASE(WSAEDISCON);
-#endif
-
-#ifdef WSAENOMORE
-  ERRNO_CASE(WSAENOMORE);
-#endif
-
-#ifdef WSAECANCELLED
-  ERRNO_CASE(WSAECANCELLED);
-#endif
-
-#ifdef WSAEINVALIDPROCTABLE
-  ERRNO_CASE(WSAEINVALIDPROCTABLE);
-#endif
-
-#ifdef WSAEINVALIDPROVIDER
-  ERRNO_CASE(WSAEINVALIDPROVIDER);
-#endif
-
-#ifdef WSAEPROVIDERFAILEDINIT
-  ERRNO_CASE(WSAEPROVIDERFAILEDINIT);
-#endif
-
-#ifdef WSASYSCALLFAILURE
-  ERRNO_CASE(WSASYSCALLFAILURE);
-#endif
-
-#ifdef WSASERVICE_NOT_FOUND
-  ERRNO_CASE(WSASERVICE_NOT_FOUND);
-#endif
-
-#ifdef WSATYPE_NOT_FOUND
-  ERRNO_CASE(WSATYPE_NOT_FOUND);
-#endif
-
-#ifdef WSA_E_NO_MORE
-  ERRNO_CASE(WSA_E_NO_MORE);
-#endif
-
-#ifdef WSA_E_CANCELLED
-  ERRNO_CASE(WSA_E_CANCELLED);
-#endif
-
   default: return "";
   }
 }
@@ -1062,18 +766,14 @@ Local<Value> ErrnoException(int errorno,
   Local<Value> e;
   Local<String> estring = String::NewSymbol(errno_string(errorno));
   if (!msg[0]) {
-#ifdef __POSIX__
     msg = strerror(errorno);
-#else // __MINGW32__
-    msg = winapi_strerror(errorno);
-#endif
   }
   Local<String> message = String::NewSymbol(msg);
 
   Local<String> cons1 = String::Concat(estring, String::NewSymbol(", "));
   Local<String> cons2 = String::Concat(cons1, message);
 
-  if (errno_symbol.IsEmpty()) {
+  if (syscall_symbol.IsEmpty()) {
     syscall_symbol = NODE_PSYMBOL("syscall");
     errno_symbol = NODE_PSYMBOL("errno");
     errpath_symbol = NODE_PSYMBOL("path");
@@ -1097,6 +797,43 @@ Local<Value> ErrnoException(int errorno,
   if (syscall) obj->Set(syscall_symbol, String::NewSymbol(syscall));
   return e;
 }
+
+
+#ifdef _WIN32
+Local<Value> WinapiErrnoException(int errorno,
+                                  const char* syscall,
+                                  const char* msg,
+                                  const char* path) {
+  Local<Value> e;
+  if (!msg || !msg[0]) {
+    msg = winapi_strerror(errorno);
+  }
+  Local<String> message = String::NewSymbol(msg);
+
+  if (syscall_symbol.IsEmpty()) {
+    syscall_symbol = NODE_PSYMBOL("syscall");
+    errno_symbol = NODE_PSYMBOL("errno");
+    errpath_symbol = NODE_PSYMBOL("path");
+    code_symbol = NODE_PSYMBOL("code");
+  }
+
+  if (path) {
+    Local<String> cons1 = String::Concat(message, String::NewSymbol(" '"));
+    Local<String> cons2 = String::Concat(cons1, String::New(path));
+    Local<String> cons3 = String::Concat(cons2, String::NewSymbol("'"));
+    e = Exception::Error(cons3);
+  } else {
+    e = Exception::Error(message);
+  }
+
+  Local<Object> obj = e->ToObject();
+
+  obj->Set(errno_symbol, Integer::New(errorno));
+  if (path) obj->Set(errpath_symbol, String::New(path));
+  if (syscall) obj->Set(syscall_symbol, String::NewSymbol(syscall));
+  return e;
+}
+#endif
 
 
 Handle<Value> FromConstructorTemplate(Persistent<FunctionTemplate>& t,
@@ -1130,7 +867,10 @@ void MakeCallback(Handle<Object> object,
                   Handle<Value> argv[]) {
   HandleScope scope;
 
-  Local<Value> callback_v = object->Get(String::New(method)); 
+  Local<Value> callback_v = object->Get(String::New(method));
+  if (!callback_v->IsFunction()) {
+    fprintf(stderr, "method = %s", method);
+  }
   assert(callback_v->IsFunction());
   Local<Function> callback = Local<Function>::Cast(callback_v);
 
@@ -1146,11 +886,21 @@ void MakeCallback(Handle<Object> object,
 }
 
 
-void SetErrno(uv_err_code code) {
-  uv_err_t err;
-  err.code = code;
-  Context::GetCurrent()->Global()->Set(String::NewSymbol("errno"),
-                                       String::NewSymbol(uv_err_name(err)));
+void SetErrno(uv_err_t err) {
+  HandleScope scope;
+
+  if (errno_symbol.IsEmpty()) {
+    errno_symbol = NODE_PSYMBOL("errno");
+  }
+
+  if (err.code == UV_UNKNOWN) {
+    char errno_buf[100];
+    snprintf(errno_buf, 100, "Unknown system errno %d", err.sys_errno_);
+    Context::GetCurrent()->Global()->Set(errno_symbol, String::New(errno_buf));
+  } else {
+    Context::GetCurrent()->Global()->Set(errno_symbol,
+                                         String::NewSymbol(uv_err_name(err)));
+  }
 }
 
 
@@ -1292,7 +1042,8 @@ void DisplayExceptionLine (TryCatch &try_catch) {
 
   Handle<Message> message = try_catch.Message();
 
-  node::Stdio::DisableRawMode(STDIN_FILENO);
+  uv_tty_reset_mode();
+
   fprintf(stderr, "\n");
 
   if (!message.IsEmpty()) {
@@ -1427,14 +1178,11 @@ static Handle<Value> Cwd(const Arguments& args) {
   return scope.Close(cwd);
 }
 
-
-#ifdef __POSIX__
-
-static Handle<Value> Umask(const Arguments& args){
+static Handle<Value> Umask(const Arguments& args) {
   HandleScope scope;
   unsigned int old;
 
-  if(args.Length() < 1 || args[0]->IsUndefined()) {
+  if (args.Length() < 1 || args[0]->IsUndefined()) {
     old = umask(0);
     umask((mode_t)old);
 
@@ -1468,12 +1216,15 @@ static Handle<Value> Umask(const Arguments& args){
 }
 
 
+#ifdef __POSIX__
+
 static Handle<Value> GetUid(const Arguments& args) {
   HandleScope scope;
   assert(args.Length() == 0);
   int uid = getuid();
   return scope.Close(Integer::New(uid));
 }
+
 
 static Handle<Value> GetGid(const Arguments& args) {
   HandleScope scope;
@@ -1522,6 +1273,7 @@ static Handle<Value> SetGid(const Arguments& args) {
   return Undefined();
 }
 
+
 static Handle<Value> SetUid(const Arguments& args) {
   HandleScope scope;
 
@@ -1561,6 +1313,7 @@ static Handle<Value> SetUid(const Arguments& args) {
   return Undefined();
 }
 
+
 #endif // __POSIX__
 
 
@@ -1585,7 +1338,7 @@ static void CheckStatus(uv_timer_t* watcher, int status) {
     }
   }
 
-  double d = uv_now() - TICK_TIME(3);
+  double d = uv_now(uv_default_loop()) - TICK_TIME(3);
 
   //printfb("timer d = %f\n", d);
 
@@ -1608,13 +1361,46 @@ static Handle<Value> Uptime(const Arguments& args) {
   return scope.Close(Number::New(uptime));
 }
 
+
+v8::Handle<v8::Value> UVCounters(const v8::Arguments& args) {
+  HandleScope scope;
+
+  uv_counters_t* c = &uv_default_loop()->counters;
+
+  Local<Object> obj = Object::New();
+
+#define setc(name) \
+    obj->Set(String::New(#name), Integer::New(static_cast<int32_t>(c->name)));
+
+  setc(eio_init)
+  setc(req_init)
+  setc(handle_init)
+  setc(stream_init)
+  setc(tcp_init)
+  setc(udp_init)
+  setc(pipe_init)
+  setc(tty_init)
+  setc(prepare_init)
+  setc(check_init)
+  setc(idle_init)
+  setc(async_init)
+  setc(timer_init)
+  setc(process_init)
+  setc(fs_event_init)
+
+#undef setc
+
+  return scope.Close(obj);
+}
+
+
 v8::Handle<v8::Value> MemoryUsage(const v8::Arguments& args) {
   HandleScope scope;
   assert(args.Length() == 0);
 
-  size_t rss, vsize;
+  size_t rss;
 
-  int r = Platform::GetMemory(&rss, &vsize);
+  int r = Platform::GetMemory(&rss);
 
   if (r != 0) {
     return ThrowException(Exception::Error(String::New(strerror(errno))));
@@ -1624,13 +1410,11 @@ v8::Handle<v8::Value> MemoryUsage(const v8::Arguments& args) {
 
   if (rss_symbol.IsEmpty()) {
     rss_symbol = NODE_PSYMBOL("rss");
-    vsize_symbol = NODE_PSYMBOL("vsize");
     heap_total_symbol = NODE_PSYMBOL("heapTotal");
     heap_used_symbol = NODE_PSYMBOL("heapUsed");
   }
 
   info->Set(rss_symbol, Integer::NewFromUnsigned(rss));
-  info->Set(vsize_symbol, Integer::NewFromUnsigned(vsize));
 
   // V8 memory usage
   HeapStatistics v8_heap_stats;
@@ -1644,8 +1428,6 @@ v8::Handle<v8::Value> MemoryUsage(const v8::Arguments& args) {
 }
 
 
-#ifdef __POSIX__
-
 Handle<Value> Kill(const Arguments& args) {
   HandleScope scope;
 
@@ -1653,84 +1435,105 @@ Handle<Value> Kill(const Arguments& args) {
     return ThrowException(Exception::Error(String::New("Bad argument.")));
   }
 
-  pid_t pid = args[0]->IntegerValue();
+  int pid = args[0]->IntegerValue();
   int sig = args[1]->Int32Value();
-  int r = kill(pid, sig);
+  uv_err_t err = uv_kill(pid, sig);
 
-  if (r != 0) return ThrowException(ErrnoException(errno, "kill"));
+  if (err.code != UV_OK) {
+    SetErrno(err);
+    return scope.Close(Integer::New(-1));
+  }
 
   return Undefined();
 }
 
 
-typedef void (*extInit)(Handle<Object> exports);
+typedef void (UV_DYNAMIC* extInit)(Handle<Object> exports);
 
 // DLOpen is node.dlopen(). Used to load 'module.node' dynamically shared
 // objects.
 Handle<Value> DLOpen(const v8::Arguments& args) {
   HandleScope scope;
+  char symbol[1024], *base, *pos;
+  uv_lib_t lib;
+  node_module_struct compat_mod;
+  uv_err_t err;
+  int r;
 
-  if (args.Length() < 2) return Undefined();
+  if (args.Length() < 2) {
+    Local<Value> exception = Exception::Error(
+        String::New("process.dlopen takes exactly 2 arguments."));
+    return ThrowException(exception);
+  }
 
   String::Utf8Value filename(args[0]->ToString()); // Cast
   Local<Object> target = args[1]->ToObject(); // Cast
 
-  // Actually call dlopen().
-  // FIXME: This is a blocking function and should be called asynchronously!
-  // This function should be moved to file.cc and use libeio to make this
-  // system call.
-  void *handle = dlopen(*filename, RTLD_LAZY);
-
-  // Handle errors.
-  if (handle == NULL) {
-    Local<Value> exception = Exception::Error(String::New(dlerror()));
+  err = uv_dlopen(*filename, &lib);
+  if (err.code != UV_OK) {
+    Local<Value> exception = Exception::Error(
+        String::Concat(String::New("Unable to load shared library "),
+        args[0]->ToString()));
     return ThrowException(exception);
   }
 
-  String::Utf8Value symbol(args[0]->ToString());
-  char *symstr = NULL;
-  {
-    char *sym = *symbol;
-    char *p = strrchr(sym, '/');
-    if (p != NULL) {
-      sym = p+1;
-    }
+  String::Utf8Value path(args[0]->ToString());
+  base = *path;
 
-    p = strrchr(sym, '.');
-    if (p != NULL) {
-      *p = '\0';
+  /* Find the shared library filename within the full path. */
+#ifdef __POSIX__
+  pos = strrchr(base, '/');
+  if (pos != NULL) {
+    base = pos + 1;
+  }
+#else // Windows
+  for (;;) {
+    pos = strpbrk(base, "\\/:");
+    if (pos == NULL) {
+      break;
     }
+    base = pos + 1;
+  }
+#endif
 
-    size_t slen = strlen(sym);
-    symstr = static_cast<char*>(calloc(1, slen + sizeof("_module") + 1));
-    memcpy(symstr, sym, slen);
-    memcpy(symstr+slen, "_module", sizeof("_module") + 1);
+  /* Strip the .node extension. */
+  pos = strrchr(base, '.');
+  if (pos != NULL) {
+    *pos = '\0';
+  }
+
+  /* Add the `_module` suffix to the extension name. */
+  r = snprintf(symbol, sizeof symbol, "%s_module", base);
+  if (r <= 0 || r >= sizeof symbol) {
+    Local<Value> exception =
+        Exception::Error(String::New("Out of memory."));
+    return ThrowException(exception);
   }
 
   // Get the init() function from the dynamically shared object.
-  node_module_struct *mod = static_cast<node_module_struct *>(dlsym(handle, symstr));
-  free(symstr);
-  // Error out if not found.
-  if (mod == NULL) {
+  node_module_struct *mod;
+  err = uv_dlsym(lib, symbol, reinterpret_cast<void**>(&mod));
+
+  if (err.code != UV_OK) {
     /* Start Compatibility hack: Remove once everyone is using NODE_MODULE macro */
-    node_module_struct compat_mod;
+    memset(&compat_mod, 0, sizeof compat_mod);
+
     mod = &compat_mod;
     mod->version = NODE_MODULE_VERSION;
 
-    void *init_handle = dlsym(handle, "init");
-    if (init_handle == NULL) {
-      dlclose(handle);
-      Local<Value> exception =
-        Exception::Error(String::New("No module symbol found in module."));
+    err = uv_dlsym(lib, "init", reinterpret_cast<void**>(&mod->register_func));
+    if (err.code != UV_OK) {
+      uv_dlclose(lib);
+      Local<Value> exception = Exception::Error(
+          String::New("Out of memory."));
       return ThrowException(exception);
     }
-    mod->register_func = (extInit)(init_handle);
     /* End Compatibility hack */
   }
 
   if (mod->version != NODE_MODULE_VERSION) {
-    Local<Value> exception =
-      Exception::Error(String::New("Module version mismatch, refusing to load."));
+    Local<Value> exception = Exception::Error(
+        String::New("Module version mismatch, refusing to load."));
     return ThrowException(exception);
   }
 
@@ -1742,47 +1545,6 @@ Handle<Value> DLOpen(const v8::Arguments& args) {
   return Undefined();
 }
 
-#endif // __POSIX__
-
-
-// TODO remove me before 0.4
-Handle<Value> Compile(const Arguments& args) {
-  HandleScope scope;
-
-
-  if (args.Length() < 2) {
-    return ThrowException(Exception::TypeError(
-          String::New("needs two arguments.")));
-  }
-
-  static bool shown_error_message = false;
-
-  if (!shown_error_message) {
-    shown_error_message = true;
-    fprintf(stderr, "(node) process.compile should not be used. "
-                    "Use require('vm').runInThisContext instead.\n");
-  }
-
-  Local<String> source = args[0]->ToString();
-  Local<String> filename = args[1]->ToString();
-
-  TryCatch try_catch;
-
-  Local<v8::Script> script = v8::Script::Compile(source, filename);
-  if (try_catch.HasCaught()) {
-    // Hack because I can't get a proper stacktrace on SyntaxError
-    ReportException(try_catch, true);
-    exit(1);
-  }
-
-  Local<Value> result = script->Run();
-  if (try_catch.HasCaught()) {
-    ReportException(try_catch, false);
-    exit(1);
-  }
-
-  return scope.Close(result);
-}
 
 static void OnFatalError(const char* location, const char* message) {
   if (location) {
@@ -1914,13 +1676,6 @@ static Handle<Value> Binding(const Arguments& args) {
     binding_cache->Set(module, exports);
 #endif
 
-  } else if (!strcmp(*module_v, "timer")) {
-#ifdef __POSIX__
-    exports = Object::New();
-    Timer::Initialize(exports);
-    binding_cache->Set(module, exports);
-
-#endif
   } else if (!strcmp(*module_v, "natives")) {
     exports = Object::New();
     DefineJavaScript(exports);
@@ -1965,27 +1720,26 @@ static Handle<Value> EnvGetter(Local<String> property,
 }
 
 
-static bool ENV_warning = false;
-static Handle<Value> EnvGetterWarn(Local<String> property,
-                                   const AccessorInfo& info) {
-  if (!ENV_warning) {
-    ENV_warning = true;
-    fprintf(stderr, "(node) Use process.env instead of process.ENV\r\n");
-  }
-  return EnvGetter(property, info);
-}
-
-
 static Handle<Value> EnvSetter(Local<String> property,
                                Local<Value> value,
                                const AccessorInfo& info) {
+  HandleScope scope;
   String::Utf8Value key(property);
   String::Utf8Value val(value);
+
 #ifdef __POSIX__
   setenv(*key, *val, 1);
 #else  // __WIN32__
-  NO_IMPL_MSG(setenv)
+  int n = key.length() + val.length() + 2;
+  char* pair = new char[n];
+  snprintf(pair, n, "%s=%s", *key, *val);
+  int r = _putenv(pair);
+  if (r) {
+    fprintf(stderr, "error putenv: '%s'\n", pair);
+  }
+  delete [] pair;
 #endif
+
   return value;
 }
 
@@ -2003,15 +1757,26 @@ static Handle<Integer> EnvQuery(Local<String> property,
 
 static Handle<Boolean> EnvDeleter(Local<String> property,
                                   const AccessorInfo& info) {
+  HandleScope scope;
+
   String::Utf8Value key(property);
+
   if (getenv(*key)) {
 #ifdef __POSIX__
     unsetenv(*key);	// prototyped as `void unsetenv(const char*)` on some platforms
 #else
-    NO_IMPL_MSG(unsetenv)
+    int n = key.length() + 2;
+    char* pair = new char[n];
+    snprintf(pair, n, "%s=", *key);
+    int r = _putenv(pair);
+    if (r) {
+      fprintf(stderr, "error unsetenv: '%s'\n", pair);
+    }
+    delete [] pair;
 #endif
     return True();
   }
+
   return False();
 }
 
@@ -2039,8 +1804,15 @@ static Handle<Object> GetFeatures() {
   HandleScope scope;
 
   Local<Object> obj = Object::New();
-  obj->Set(String::NewSymbol("uv"), Boolean::New(use_uv));
-  obj->Set(String::NewSymbol("http1"), Boolean::New(use_http1));
+  obj->Set(String::NewSymbol("debug"),
+#if defined(DEBUG) && DEBUG
+    True()
+#else
+    False()
+#endif
+  );
+
+  obj->Set(String::NewSymbol("uv"), True());
   obj->Set(String::NewSymbol("ipv6"), True()); // TODO ping libuv
   obj->Set(String::NewSymbol("tls_npn"), Boolean::New(use_npn));
   obj->Set(String::NewSymbol("tls_sni"), Boolean::New(use_sni));
@@ -2050,6 +1822,8 @@ static Handle<Object> GetFeatures() {
   return scope.Close(obj);
 }
 
+
+static Handle<Value> DebugProcess(const Arguments& args);
 
 Handle<Object> SetupProcessObject(int argc, char *argv[]) {
   HandleScope scope;
@@ -2068,8 +1842,10 @@ Handle<Object> SetupProcessObject(int argc, char *argv[]) {
   // process.version
   process->Set(String::NewSymbol("version"), String::New(NODE_VERSION));
 
+#ifdef NODE_PREFIX
   // process.installPrefix
   process->Set(String::NewSymbol("installPrefix"), String::New(NODE_PREFIX));
+#endif
 
   // process.moduleLoadList
   module_load_list = Persistent<Array>::New(Array::New());
@@ -2084,10 +1860,10 @@ Handle<Object> SetupProcessObject(int argc, char *argv[]) {
   versions->Set(String::NewSymbol("ares"), String::New(ARES_VERSION_STR));
   snprintf(buf, 20, "%d.%d", UV_VERSION_MAJOR, UV_VERSION_MINOR);
   versions->Set(String::NewSymbol("uv"), String::New(buf));
-#ifdef HAVE_OPENSSL
+#if HAVE_OPENSSL
   // Stupid code to slice out the version string.
   int c, l = strlen(OPENSSL_VERSION_TEXT);
-  for (i = 0; i < l; i++) {
+  for (i = j = 0; i < l; i++) {
     c = OPENSSL_VERSION_TEXT[i];
     if ('0' <= c && c <= '9') {
       for (j = i + 1; j < l; j++) {
@@ -2117,7 +1893,6 @@ Handle<Object> SetupProcessObject(int argc, char *argv[]) {
     arguments->Set(Integer::New(j), arg);
   }
   // assign it
-  process->Set(String::NewSymbol("ARGV"), arguments);
   process->Set(String::NewSymbol("argv"), arguments);
 
   // create process.env
@@ -2131,18 +1906,6 @@ Handle<Object> SetupProcessObject(int argc, char *argv[]) {
   Local<Object> env = envTemplate->NewInstance();
   process->Set(String::NewSymbol("env"), env);
 
-  // create process.ENV
-  // TODO: remove me at some point.
-  Local<ObjectTemplate> ENVTemplate = ObjectTemplate::New();
-  ENVTemplate->SetNamedPropertyHandler(EnvGetterWarn,
-                                       EnvSetter,
-                                       EnvQuery,
-                                       EnvDeleter,
-                                       EnvEnumerator,
-                                       Undefined());
-  Local<Object> ENV = ENVTemplate->NewInstance();
-  process->Set(String::NewSymbol("ENV"), ENV);
-
   process->Set(String::NewSymbol("pid"), Integer::New(getpid()));
   process->Set(String::NewSymbol("features"), GetFeatures());
 
@@ -2152,21 +1915,23 @@ Handle<Object> SetupProcessObject(int argc, char *argv[]) {
   }
 
   size_t size = 2*PATH_MAX;
-  char execPath[size];
+  char* execPath = new char[size];
   if (uv_exepath(execPath, &size) != 0) {
     // as a last ditch effort, fallback on argv[0] ?
     process->Set(String::NewSymbol("execPath"), String::New(argv[0]));
   } else {
     process->Set(String::NewSymbol("execPath"), String::New(execPath, size));
   }
+  delete [] execPath;
 
 
   // define various internal methods
-  NODE_SET_METHOD(process, "compile", Compile);
   NODE_SET_METHOD(process, "_needTickCallback", NeedTickCallback);
   NODE_SET_METHOD(process, "reallyExit", Exit);
   NODE_SET_METHOD(process, "chdir", Chdir);
   NODE_SET_METHOD(process, "cwd", Cwd);
+
+  NODE_SET_METHOD(process, "umask", Umask);
 
 #ifdef __POSIX__
   NODE_SET_METHOD(process, "getuid", GetUid);
@@ -2174,14 +1939,17 @@ Handle<Object> SetupProcessObject(int argc, char *argv[]) {
 
   NODE_SET_METHOD(process, "setgid", SetGid);
   NODE_SET_METHOD(process, "getgid", GetGid);
-
-  NODE_SET_METHOD(process, "umask", Umask);
-  NODE_SET_METHOD(process, "dlopen", DLOpen);
-  NODE_SET_METHOD(process, "_kill", Kill);
 #endif // __POSIX__
+
+  NODE_SET_METHOD(process, "_kill", Kill);
+
+  NODE_SET_METHOD(process, "_debugProcess", DebugProcess);
+
+  NODE_SET_METHOD(process, "dlopen", DLOpen);
 
   NODE_SET_METHOD(process, "uptime", Uptime);
   NODE_SET_METHOD(process, "memoryUsage", MemoryUsage);
+  NODE_SET_METHOD(process, "uvCounters", UVCounters);
 
   NODE_SET_METHOD(process, "binding", Binding);
 
@@ -2190,13 +1958,12 @@ Handle<Object> SetupProcessObject(int argc, char *argv[]) {
 
 
 static void AtExit() {
-  node::Stdio::Flush();
-  node::Stdio::DisableRawMode(STDIN_FILENO);
+  uv_tty_reset_mode();
 }
 
 
 static void SignalExit(int signal) {
-  Stdio::DisableRawMode(STDIN_FILENO);
+  uv_tty_reset_mode();
   _exit(1);
 }
 
@@ -2276,7 +2043,7 @@ static void ParseDebugOpt(const char* arg) {
 
 static void PrintHelp() {
   printf("Usage: node [options] [ -e script | script.js ] [arguments] \n"
-         "       node debug [ -e script | script.js ] [arguments] \n"
+         "       node debug script.js [arguments] \n"
          "\n"
          "Options:\n"
          "  -v, --version        print node's version\n"
@@ -2284,8 +2051,6 @@ static void PrintHelp() {
          "  --v8-options         print v8 command line options\n"
          "  --vars               print various compiled-in variables\n"
          "  --max-stack-size=val set max v8 stack size (bytes)\n"
-         "  --use-uv             use the libuv backend\n"
-         "  --use-http1          use the legacy http library\n"
          "\n"
          "Enviromental variables:\n"
          "NODE_PATH              ':'-separated list of directories\n"
@@ -2307,18 +2072,16 @@ static void ParseArgs(int argc, char **argv) {
     if (strstr(arg, "--debug") == arg) {
       ParseDebugOpt(arg);
       argv[i] = const_cast<char*>("");
-    } else if (!strcmp(arg, "--use-uv")) {
-      use_uv = true;
-      argv[i] = const_cast<char*>("");
-    } else if (!strcmp(arg, "--use-http1")) {
-      use_http1 = true;
-      argv[i] = const_cast<char*>("");
     } else if (strcmp(arg, "--version") == 0 || strcmp(arg, "-v") == 0) {
       printf("%s\n", NODE_VERSION);
       exit(0);
     } else if (strcmp(arg, "--vars") == 0) {
+#ifdef NODE_PREFIX
       printf("NODE_PREFIX: %s\n", NODE_PREFIX);
+#endif
+#ifdef NODE_CFLAGS
       printf("NODE_CFLAGS: %s\n", NODE_CFLAGS);
+#endif
       exit(0);
     } else if (strstr(arg, "--max-stack-size=") == arg) {
       const char *p = 0;
@@ -2346,7 +2109,14 @@ static void ParseArgs(int argc, char **argv) {
 }
 
 
+static Isolate* node_isolate = NULL;
+static volatile bool debugger_running = false;
+
 static void EnableDebug(bool wait_connect) {
+  // If we're called from another thread, make sure to enter the right
+  // v8 isolate.
+  node_isolate->Enter();
+
   // Start the debug thread and it's associated TCP server on port 5858.
   bool r = Debug::EnableAgent("node " NODE_VERSION, debug_port);
 
@@ -2362,41 +2132,210 @@ static void EnableDebug(bool wait_connect) {
   assert(r);
 
   // Print out some information.
-  fprintf(stderr, "debugger listening on port %d", debug_port);
+  fprintf(stderr, "debugger listening on port %d\n", debug_port);
+  fflush(stderr);
+
+  debugger_running = true;
+
+  node_isolate->Exit();
 }
 
 
-static volatile bool hit_signal;
+#ifdef __POSIX__
+static void EnableDebugSignalHandler(int signal) {
+  // Break once process will return execution to v8
+  v8::Debug::DebugBreak(node_isolate);
 
-
-static void DebugSignalCB(const Debug::EventDetails& details) {
-  if (hit_signal && details.GetEvent() == v8::Break) {
-    hit_signal = false;
+  if (!debugger_running) {
     fprintf(stderr, "Hit SIGUSR1 - starting debugger agent.\n");
     EnableDebug(false);
   }
 }
 
 
-static void EnableDebugSignalHandler(int signal) {
-  // This is signal safe.
-  hit_signal = true;
-  v8::Debug::SetDebugEventListener2(DebugSignalCB);
-  v8::Debug::DebugBreak();
-}
-
-
-#ifdef __POSIX__
-
-static int RegisterSignalHandler(int signal, void (*handler)(int)) {
+static void RegisterSignalHandler(int signal, void (*handler)(int)) {
   struct sigaction sa;
 
   memset(&sa, 0, sizeof(sa));
   sa.sa_handler = handler;
   sigfillset(&sa.sa_mask);
-  return sigaction(signal, &sa, NULL);
+  sigaction(signal, &sa, NULL);
+}
+
+
+Handle<Value> DebugProcess(const Arguments& args) {
+  HandleScope scope;
+
+  if (args.Length() != 1) {
+    return ThrowException(Exception::Error(
+        String::New("Invalid number of arguments.")));
+  }
+
+  pid_t pid;
+  int r;
+
+  pid = args[0]->IntegerValue();
+  r = kill(pid, SIGUSR1);
+  if (r != 0) {
+    return ThrowException(ErrnoException(errno, "kill"));
+  }
+
+  return Undefined();
 }
 #endif // __POSIX__
+
+
+#ifdef _WIN32
+DWORD WINAPI EnableDebugThreadProc(void* arg) {
+  // Break once process will return execution to v8
+  if (!debugger_running) {
+    for (int i = 0; i < 1; i++) {
+      fprintf(stderr, "Starting debugger agent.\r\n");
+      fflush(stderr);
+      EnableDebug(false);
+    }
+  }
+
+  v8::Debug::DebugBreak();
+
+  return 0;
+}
+
+
+static int GetDebugSignalHandlerMappingName(DWORD pid, char* buf, size_t buf_len) {
+  return snprintf(buf, buf_len, "node-debug-handler-%u", pid);
+}
+
+
+static int RegisterDebugSignalHandler() {
+  char mapping_name[32];
+  HANDLE mapping_handle;
+  DWORD pid;
+  LPTHREAD_START_ROUTINE* handler;
+
+  pid = GetCurrentProcessId();
+
+  if (GetDebugSignalHandlerMappingName(pid,
+                                       mapping_name,
+                                       sizeof mapping_name) < 0) {
+    return -1;
+  }
+
+  mapping_handle = CreateFileMappingA(INVALID_HANDLE_VALUE,
+                                      NULL,
+                                      PAGE_READWRITE,
+                                      0,
+                                      sizeof *handler,
+                                      mapping_name);
+  if (mapping_handle == NULL) {
+    return -1;
+  }
+
+  handler = (LPTHREAD_START_ROUTINE*) MapViewOfFile(mapping_handle,
+                                                    FILE_MAP_ALL_ACCESS,
+                                                    0,
+                                                    0,
+                                                    sizeof *handler);
+  if (handler == NULL) {
+    CloseHandle(mapping_handle);
+    return -1;
+  }
+
+  *handler = EnableDebugThreadProc;
+
+  UnmapViewOfFile((void*) handler);
+
+  return 0;
+}
+
+
+static Handle<Value> DebugProcess(const Arguments& args) {
+  HandleScope scope;
+  Handle<Value> rv = Undefined();
+  DWORD pid;
+  HANDLE process = NULL;
+  HANDLE thread = NULL;
+  HANDLE mapping = NULL;
+  char mapping_name[32];
+  LPTHREAD_START_ROUTINE* handler = NULL;
+
+  if (args.Length() != 1) {
+    rv = ThrowException(Exception::Error(String::New("Invalid number of arguments.")));
+    goto out;
+  }
+
+  pid = (DWORD) args[0]->IntegerValue();
+
+  process = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION |
+                            PROCESS_VM_OPERATION | PROCESS_VM_WRITE |
+                            PROCESS_VM_READ,
+                        FALSE,
+                        pid);
+  if (process == NULL) {
+    rv = ThrowException(WinapiErrnoException(GetLastError(), "OpenProcess"));
+    goto out;
+  }
+
+  if (GetDebugSignalHandlerMappingName(pid,
+                                       mapping_name,
+                                       sizeof mapping_name) < 0) {
+    rv = ThrowException(ErrnoException(errno, "sprintf"));
+    goto out;
+  }
+
+  mapping = OpenFileMapping(FILE_MAP_READ, FALSE, mapping_name);
+  if (mapping == NULL) {
+    rv = ThrowException(WinapiErrnoException(GetLastError(), "sprintf"));
+    goto out;
+  }
+
+  handler = (LPTHREAD_START_ROUTINE*) MapViewOfFile(mapping,
+                                                    FILE_MAP_READ,
+                                                    0,
+                                                    0,
+                                                    sizeof *handler);
+  if (handler == NULL || *handler == NULL) {
+    rv = ThrowException(WinapiErrnoException(GetLastError(), "MapViewOfFile"));
+    goto out;
+  }
+
+  thread = CreateRemoteThread(process,
+                              NULL,
+                              0,
+                              *handler,
+                              NULL,
+                              0,
+                              NULL);
+  if (thread == NULL) {
+    rv = ThrowException(WinapiErrnoException(GetLastError(),
+                                             "CreateRemoteThread"));
+    goto out;
+  }
+
+  // Wait for the thread to terminate
+  if (WaitForSingleObject(thread, INFINITE) != WAIT_OBJECT_0) {
+    rv = ThrowException(WinapiErrnoException(GetLastError(),
+                                             "WaitForSingleObject"));
+    goto out;
+  }
+
+ out:
+  if (process != NULL) {
+   CloseHandle(process);
+  }
+  if (thread != NULL) {
+    CloseHandle(thread);
+  }
+  if (handler != NULL) {
+    UnmapViewOfFile(handler);
+  }
+  if (mapping != NULL) {
+    CloseHandle(mapping);
+  }
+
+  return Undefined();
+}
+#endif // _WIN32
 
 
 char** Init(int argc, char *argv[]) {
@@ -2443,43 +2382,26 @@ char** Init(int argc, char *argv[]) {
   RegisterSignalHandler(SIGTERM, SignalExit);
 #endif // __POSIX__
 
-  uv_prepare_init(&node::prepare_tick_watcher);
+  uv_prepare_init(uv_default_loop(), &node::prepare_tick_watcher);
   uv_prepare_start(&node::prepare_tick_watcher, PrepareTick);
-  uv_unref();
+  uv_unref(uv_default_loop());
 
-  uv_check_init(&node::check_tick_watcher);
+  uv_check_init(uv_default_loop(), &node::check_tick_watcher);
   uv_check_start(&node::check_tick_watcher, node::CheckTick);
-  uv_unref();
+  uv_unref(uv_default_loop());
 
-  uv_idle_init(&node::tick_spinner);
-  uv_unref();
+  uv_idle_init(uv_default_loop(), &node::tick_spinner);
+  uv_unref(uv_default_loop());
 
-  uv_check_init(&node::gc_check);
+  uv_check_init(uv_default_loop(), &node::gc_check);
   uv_check_start(&node::gc_check, node::Check);
-  uv_unref();
+  uv_unref(uv_default_loop());
 
-  uv_idle_init(&node::gc_idle);
-  uv_unref();
+  uv_idle_init(uv_default_loop(), &node::gc_idle);
+  uv_unref(uv_default_loop());
 
-  uv_timer_init(&node::gc_timer);
-  uv_unref();
-
-  // Setup the EIO thread pool. It requires 3, yes 3, watchers.
-  {
-    uv_idle_init(&node::eio_poller);
-    uv_idle_start(&eio_poller, node::DoPoll);
-
-    uv_async_init(&node::eio_want_poll_notifier, node::WantPollNotifier);
-    uv_unref();
-
-    uv_async_init(&node::eio_done_poll_notifier, node::DonePollNotifier);
-    uv_unref();
-
-    eio_init(node::EIOWantPoll, node::EIODonePoll);
-    // Don't handle more than 10 reqs on each eio_poll(). This is to avoid
-    // race conditions. See test/simple/test-eio-race.js
-    eio_set_max_poll_reqs(10);
-  }
+  uv_timer_init(uv_default_loop(), &node::gc_timer);
+  uv_unref(uv_default_loop());
 
   V8::SetFatalErrorHandler(node::OnFatalError);
 
@@ -2487,20 +2409,27 @@ char** Init(int argc, char *argv[]) {
   // Set the callback DebugMessageDispatch which is called from the debug
   // thread.
   Debug::SetDebugMessageDispatchHandler(node::DebugMessageDispatch);
+
   // Initialize the async watcher. DebugMessageCallback() is called from the
   // main thread to execute a random bit of javascript - which will give V8
   // control so it can handle whatever new message had been received on the
   // debug thread.
-  uv_async_init(&node::debug_watcher, node::DebugMessageCallback);
+  uv_async_init(uv_default_loop(), &node::debug_watcher,
+      node::DebugMessageCallback);
   // unref it so that we exit the event loop despite it being active.
-  uv_unref();
+  uv_unref(uv_default_loop());
 
+  // Fetch a reference to the main isolate, so we have a reference to it
+  // even when we need it to access it from another (debugger) thread.
+  node_isolate = Isolate::GetCurrent();
 
   // If the --debug flag was specified then initialize the debug thread.
   if (node::use_debug_agent) {
     EnableDebug(debug_wait_connect);
   } else {
-#ifdef __POSIX__
+#ifdef _WIN32
+    RegisterDebugSignalHandler();
+#else // Posix
     RegisterSignalHandler(SIGUSR1, EnableDebugSignalHandler);
 #endif // __POSIX__
   }
@@ -2524,13 +2453,6 @@ void EmitExit(v8::Handle<v8::Object> process) {
 
 
 int Start(int argc, char *argv[]) {
-
-#if defined __MINGW32__ && defined PTW32_STATIC_LIB
-  pthread_win32_process_attach_np();
-#endif
-
-  uv_init();
-
   // This needs to run *before* V8::Initialize()
   argv = Init(argc, argv);
 
@@ -2542,6 +2464,7 @@ int Start(int argc, char *argv[]) {
   v8::Context::Scope context_scope(context);
 
   Handle<Object> process = SetupProcessObject(argc, argv);
+  v8_typed_array::AttachBindings(context->Global());
 
   // Create all the objects, load modules, do everything.
   // so your next reading stop should be node::Load()!
@@ -2552,7 +2475,7 @@ int Start(int argc, char *argv[]) {
   // there are no watchers on the loop (except for the ones that were
   // uv_unref'd) then this function exits. As long as there are active
   // watchers, it blocks.
-  uv_run();
+  uv_run(uv_default_loop());
 
   EmitExit(process);
 
@@ -2561,10 +2484,6 @@ int Start(int argc, char *argv[]) {
   context.Dispose();
   V8::Dispose();
 #endif  // NDEBUG
-
-#if defined __MINGW32__ && defined PTW32_STATIC_LIB
-  pthread_win32_process_detach_np();
-#endif
 
   return 0;
 }

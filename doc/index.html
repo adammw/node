@@ -26,8 +26,7 @@
         <li><a href="#download">Download</a></li>
         <li><a href="https://github.com/joyent/node/wiki/ChangeLog">ChangeLog</a></li>
         <li><a href="#about">About</a></li>
-        <li><a href="http://nodejs.org/docs/v0.4.10/api">v0.4.10 docs</a></li>
-        <li><a href="http://nodejs.org/docs/v0.5.3/api">v0.5.3 docs</a></li>
+        <li><a href="http://nodejs.org/docs/v0.6.0/api">v0.6.0 docs</a></li>
         <br/>
         <li><a href="https://github.com/joyent/node/wiki">Wiki</a></li>
         <li><a href="http://blog.nodejs.org/">Blog</a></li>
@@ -89,7 +88,7 @@ server.listen(1337, "127.0.0.1");
 </pre>
 
       <p>
-        See the <a href="/docs">API documentation</a> for more
+        See the <a href="/docs/latest/api/">API documentation</a> for more
         examples.
       </p>
 
@@ -107,20 +106,14 @@ server.listen(1337, "127.0.0.1");
       <h2 id="download">Download</h2>
 
       <p>
-        <a href="http://github.com/joyent/node/tree/master">git repo</a>
+        <a href="https://github.com/joyent/node/tree/master">git repo</a>
       </p>
 
-      <p>2011.07.19 v0.4.10 (stable)
+      <p>2011.11.04 v0.6.0
       <ul class="release">
-        <li><a href="http://nodejs.org/dist/node-v0.4.10.tar.gz"><code>node-v0.4.10.tar.gz</code> Source Code</a>
-        <li><a href="http://nodejs.org/docs/v0.4.10/api/index.html">Documentation</a>
-      </ul>
-
-      <p>2011.08.01 v0.5.3 (unstable)
-      <ul class="release">
-        <li><a href="http://nodejs.org/dist/v0.5.3/node-v0.5.3.tar.gz"><code>node-v0.5.3.tar.gz</code> Source code</a>
-        <li><a href="http://nodejs.org/dist/v0.5.3/node.exe"><code>node.exe</code> Windows executable</a>
-        <li><a href="http://nodejs.org/docs/v0.5.3/api/index.html">Documentation</a>
+        <li><a href="http://nodejs.org/dist/v0.6.0/node-v0.6.0.tar.gz"><code>node-v0.6.0.tar.gz</code> Source code</a>
+        <li><a href="http://nodejs.org/dist/v0.6.0/node.exe"><code>node.exe</code> Windows executable</a>
+        <li><a href="http://nodejs.org/docs/v0.6.0/api/index.html">Documentation</a>
       </ul>
 
 
@@ -184,7 +177,7 @@ server.listen(1337, "127.0.0.1");
         grown out of the author's experiences developing and working with
         web servers. For example, streaming data through most web frameworks
         is impossible.  Node attempts to correct these problems in its HTTP
-        <a href="http://github.com/ry/http-parser/tree/master">parser</a>
+        <a href="https://github.com/joyent/http-parser/tree/master">parser</a>
         and API. Coupled with Node's purely evented infrastructure, it makes
         a good foundation for web libraries or frameworks.
       </p>
@@ -194,8 +187,12 @@ server.listen(1337, "127.0.0.1");
         But what about multiple-processor concurrency? Aren't threads
         necessary to scale programs to multi-core computers?
         </i>
-        You can start new processes via <code>child_process.fork()</code>
+        You can start new processes via
+        <a href="http://nodejs.org/docs/latest/api/child_processes.html#child_process.fork"><code>child_process.fork()</code></a>
         these other processes will be scheduled in parallel.
+        For load balancing incoming connections across multiple processes
+        use <a href="http://nodejs.org/docs/latest/api/cluster.html">the
+        cluster module</a>
       </p>
 
       <p>

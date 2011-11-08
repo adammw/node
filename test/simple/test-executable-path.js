@@ -22,21 +22,31 @@
 var common = require('../common');
 var assert = require('assert');
 var path = require('path');
+var match = false;
 
-var isDebug = (process.version.indexOf('debug') >= 0);
+var isDebug = process.features.debug;
 
-var debugPath = path.normalize(path.join(__dirname, '..', '..',
-                                         'build', 'debug', 'node_g'));
-var defaultPath = path.normalize(path.join(__dirname, '..', '..',
-                                           'build', 'default', 'node'));
+var debugPaths = [ path.normalize(path.join(__dirname, '..', '..',
+                                         'out', 'Debug', 'node')),
+                   path.normalize(path.join(__dirname, '..', '..',
+                                         'Debug', 'node'))];
+var defaultPaths = [ path.normalize(path.join(__dirname, '..', '..',
+                                           'out', 'Release', 'node')),
+                     path.normalize(path.join(__dirname, '..', '..',
+                                           'Release', 'node'))];
 
-console.error('debugPath: ' + debugPath);
-console.error('defaultPath: ' + defaultPath);
+console.error('debugPaths: ' + debugPaths);
+console.error('defaultPaths: ' + defaultPaths);
 console.error('process.execPath: ' + process.execPath);
 
-if (/node_g$/.test(process.execPath)) {
-  assert.ok(process.execPath.indexOf(debugPath) == 0);
+if (isDebug) {
+  debugPaths.forEach(function(path) {
+    match = match || process.execPath.indexOf(path) == 0;
+  });
 } else {
-  assert.ok(process.execPath.indexOf(defaultPath) == 0);
+  defaultPaths.forEach(function(path) {
+    match = match || process.execPath.indexOf(path) == 0;
+  });
 }
 
+assert.ok(match);

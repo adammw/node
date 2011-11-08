@@ -19,55 +19,50 @@
 // OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
 // USE OR OTHER DEALINGS IN THE SOFTWARE.
 
+
+
+
 var common = require('../common');
 var assert = require('assert');
 
 var spawn = require('child_process').spawn;
+
+var is_windows = process.platform === 'win32';
 
 var exitCode;
 var termSignal;
 var gotStdoutEOF = false;
 var gotStderrEOF = false;
 
-var ping = "42\n";
+var cat = spawn(is_windows ? 'cmd' : 'cat');
 
-var cat = spawn('cat');
 
-//
-// This test sends a signal to a child process.
-//
-// There is a potential race here where the signal is delivered
-// after the fork() but before execve(). IOW, the signal is sent
-// before the child process has truly been started.
-//
-// So we wait for a sign of life from the child (the ping response)
-// before sending the signal.
-//
-cat.stdin.write(ping);
-
-cat.stdout.addListener('data', function(chunk) {
-  assert.equal(chunk.toString(), ping);
-  cat.kill();
-});
-
-cat.stdout.addListener('end', function() {
-  gotStdoutEOF = true;
-});
-
-cat.stderr.addListener('data', function(chunk) {
+cat.stdout.on('data', function(chunk) {
   assert.ok(false);
 });
 
-cat.stderr.addListener('end', function() {
+cat.stdout.on('end', function() {
+  gotStdoutEOF = true;
+});
+
+cat.stderr.on('data', function(chunk) {
+  assert.ok(false);
+});
+
+cat.stderr.on('end', function() {
   gotStderrEOF = true;
 });
 
-cat.addListener('exit', function(code, signal) {
+cat.on('exit', function(code, signal) {
   exitCode = code;
   termSignal = signal;
 });
 
-process.addListener('exit', function() {
+assert.equal(cat.killed, false);
+cat.kill();
+assert.equal(cat.killed, true);
+
+process.on('exit', function() {
   assert.strictEqual(exitCode, null);
   assert.strictEqual(termSignal, 'SIGTERM');
   assert.ok(gotStdoutEOF);
