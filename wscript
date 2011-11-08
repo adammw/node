@@ -49,6 +49,18 @@ jobs=1
 if os.environ.has_key('JOBS'):
   jobs = int(os.environ['JOBS'])
 
+def platform_is(platform_test, env={}, checkIn=False):
+  if (env is not None and 'DEST_OS' in env and len(env['DEST_OS'])):
+    if checkIn:
+      return platform_test in env['DEST_OS']
+    else:
+      return env['DEST_OS'].startswith(platform_test)
+  else:
+    if checkIn:
+      return platform_test in sys.platform
+    else:
+      return sys.platform.startswith(platform_test)
+
 def safe_path(path):
   return path.replace("\\", "/")
 
@@ -265,8 +277,8 @@ def configure(conf):
 
   conf.env["USE_DEBUG"] = o.debug
   # Snapshot building does noet seem to work on mingw32
-  conf.env["SNAPSHOT_V8"] = not o.without_snapshot and not sys.platform.startswith("win32")
-  if sys.platform.startswith("sunos"):
+  conf.env["SNAPSHOT_V8"] = not o.without_snapshot and not platform_is("win32", conf.env)
+  if platform_is("sunos", conf.env):
     conf.env["SNAPSHOT_V8"] = False
   conf.env["USE_PROFILING"] = o.profile
 
@@ -276,22 +288,22 @@ def configure(conf):
 
   conf.env["USE_GDBJIT"] = o.use_gdbjit
 
-  if not conf.env["USE_SHARED_ZLIB"] and not sys.platform.startswith("win32"):
+  if not conf.env["USE_SHARED_ZLIB"] and not platform_is("win32", conf.env):
     conf.env.append_value("LINKFLAGS", "-lz")
 
   conf.check(lib='dl', uselib_store='DL')
-  if not sys.platform.startswith("sunos") and not sys.platform.startswith("win32"):
+  if not platform_is("sunos", conf.env) and not platform_is("win32", conf.env):
     conf.env.append_value("CCFLAGS", "-rdynamic")
     conf.env.append_value("LINKFLAGS_DL", "-rdynamic")
 
-  if sys.platform.startswith("freebsd") or sys.platform.startswith("openbsd"):
+  if platform_is("freebsd", conf.env) or platform_is("openbsd", conf.env):
     conf.check(lib='kvm', uselib_store='KVM')
 
   #if Options.options.debug:
   #  conf.check(lib='profiler', uselib_store='PROFILER')
 
   if Options.options.dtrace:
-    if not sys.platform.startswith("sunos"):
+    if not platform_is("sunos", conf.env):
       conf.fatal('DTrace support only currently available on Solaris')
 
     conf.find_program('dtrace', var='DTRACE', mandatory=True)
@@ -301,7 +313,7 @@ def configure(conf):
   if Options.options.efence:
     conf.check(lib='efence', libpath=['/usr/lib', '/usr/local/lib'], uselib_store='EFENCE')
 
-  if sys.platform.startswith("freebsd"):
+  if platform_is("freebsd", conf.env):
      if not conf.check(lib="execinfo",
                        includes=['/usr/include', '/usr/local/include'],
                        libpath=['/usr/lib', '/usr/local/lib'],
@@ -324,20 +336,20 @@ def configure(conf):
     else:
       if o.openssl_libpath: 
         openssl_libpath = [o.openssl_libpath]
-      elif not sys.platform.startswith('win32'):
+      elif not platform_is("win32", conf.env):
         openssl_libpath = ['/usr/lib', '/usr/local/lib', '/opt/local/lib', '/usr/sfw/lib']
       else:
         openssl_libpath = [normpath(join(cwd, '../openssl'))]
 
       if o.openssl_includes: 
         openssl_includes = [o.openssl_includes]
-      elif not sys.platform.startswith('win32'):
+      elif not platform_is("win32", conf.env):
         openssl_includes = [];
       else:
         openssl_includes = [normpath(join(cwd, '../openssl/include'))];
 
       openssl_lib_names = ['ssl', 'crypto']
-      if sys.platform.startswith('win32'):
+      if platform_is("win32", conf.env):
         openssl_lib_names += ['ws2_32', 'gdi32']
 
       libssl = conf.check_cc(lib=openssl_lib_names,
@@ -356,7 +368,7 @@ def configure(conf):
       if libcrypto and libssl:
         conf.env["USE_OPENSSL"] = Options.options.use_openssl = True
         conf.env.append_value("CPPFLAGS", "-DHAVE_OPENSSL=1")
-      elif sys.platform.startswith('win32'):
+      elif platform_is("win32", conf.env):
         conf.fatal("Could not autodetect OpenSSL support. " +
                    "Use the --openssl-libpath and --openssl-includes options to set the search path. " +
                    "Use configure --without-ssl to disable this message.")
@@ -380,7 +392,7 @@ def configure(conf):
 
   have_librt = conf.check(lib='rt', uselib_store='RT')
 
-  if sys.platform.startswith("sunos"):
+  if platform_is("sunos", conf.env):
     code =  """
       #include <ifaddrs.h>
       int main(void) {
@@ -423,16 +435,16 @@ def configure(conf):
 
   conf.define("HAVE_CONFIG_H", 1)
 
-  if sys.platform.startswith("sunos"):
+  if platform_is("sunos", conf.env):
     conf.env.append_value ('CCFLAGS', '-threads')
     conf.env.append_value ('CXXFLAGS', '-threads')
     #conf.env.append_value ('LINKFLAGS', ' -threads')
-  elif not sys.platform.startswith("win32"):
+  elif not platform_is("win32", conf.env):
     threadflags='-pthread'
     conf.env.append_value ('CCFLAGS', threadflags)
     conf.env.append_value ('CXXFLAGS', threadflags)
     conf.env.append_value ('LINKFLAGS', threadflags)
-  if sys.platform.startswith("darwin"):
+  if platform_is("darwin", conf.env):
     # used by platform_darwin_*.cc
     conf.env.append_value('LINKFLAGS', ['-framework','Carbon'])
     # cross compile for architecture specified by DEST_CPU
@@ -462,7 +474,7 @@ def configure(conf):
   conf.env.append_value('CPPFLAGS',  '-D_FILE_OFFSET_BITS=64')
 
   # Makes select on windows support more than 64 FDs
-  if sys.platform.startswith("win32"):
+  if platform_is("win32", conf.env):
     conf.env.append_value('CPPFLAGS', '-DFD_SETSIZE=1024');
 
   ## needed for node_file.cc fdatasync
@@ -488,7 +500,7 @@ def configure(conf):
   conf.env.append_value('CPPFLAGS', '-DPLATFORM="' + conf.env['DEST_OS'] + '"')
 
   # posix?
-  if not sys.platform.startswith('win'):
+  if not platform_is("win", conf.env):
     conf.env.append_value('CPPFLAGS', '-D__POSIX__=1')
 
   platform_file = "src/platform_%s.cc" % conf.env['DEST_OS']
@@ -503,7 +515,7 @@ def configure(conf):
     conf.env.append_value('CPPFLAGS', '-pg')
     conf.env.append_value('LINKFLAGS', '-pg')
 
-  if sys.platform.startswith("win32"):
+  if platform_is("win32", conf.env):
     conf.env.append_value('LIB', 'psapi')
     conf.env.append_value('LIB', 'winmm')
     # This enforces ws2_32 to be linked after crypto, otherwise the linker
@@ -551,6 +563,11 @@ def v8_cmd(bld, variant):
   if bld.env['DEST_CPU']:
     arch = "arch="+bld.env['DEST_CPU']
 
+  # Possible values are (linux, macos, freebsd, openbsd, solaris, win32)
+  os = "os=linux"
+  if bld.env['DEST_OS']:
+    os = "os="+bld.env['DEST_OS']
+
   toolchain = "gcc"
 
   if variant == "Release":
@@ -563,7 +580,7 @@ def v8_cmd(bld, variant):
   else:
     snapshot = ""
 
-  cmd_R = '"%s" "%s" -j %d -C "%s" -Y "%s" visibility=default mode=%s %s toolchain=%s library=static %s'
+  cmd_R = '"%s" "%s" -j %d -C "%s" -Y "%s" visibility=default mode=%s %s %s toolchain=%s library=static %s'
 
   cmd = cmd_R % ( sys.executable 
                 , scons
@@ -572,6 +589,7 @@ def v8_cmd(bld, variant):
                 , safe_path(v8dir_src)
                 , mode
                 , arch
+                , os
                 , toolchain
                 , snapshot
                 )
@@ -579,7 +597,7 @@ def v8_cmd(bld, variant):
   if bld.env["USE_GDBJIT"]:
     cmd += ' gdbjit=on '
 
-  if sys.platform.startswith("sunos"):
+  if platform_is("sunos", bld.env):
     cmd += ' toolchain=gcc strictaliasing=off'
 
 
@@ -654,6 +672,8 @@ def build_uv(bld):
   uv.env.env = dict(os.environ)
   uv.env.env['CC'] = sh_escape(bld.env['CC'][0])
   uv.env.env['CXX'] = sh_escape(bld.env['CXX'][0])
+
+  #TODO: Pass DEST_OS environmental variable to uv and/or make uv build for DEST_OS rather than based on uname
 
   t = join(bld.srcnode.abspath(bld.env_of_name("Release")), uv.target)
   bld.env_of_name('Release').append_value("LINKFLAGS_UV", t)
@@ -798,7 +818,7 @@ def build(bld):
 
     bld.install_files('${LIBDIR}/dtrace', 'src/node.d')
 
-    if sys.platform.startswith("sunos"):
+    if platform_is("sunos", bld.env):
       #
       # The USDT DTrace provider works slightly differently on Solaris than on
       # the Mac; on Solaris, any objects that have USDT DTrace probes must be
@@ -889,7 +909,7 @@ def build(bld):
   if bld.env["USE_DTRACE"]:
     node.source += " src/node_dtrace.cc "
 
-  if not sys.platform.startswith("win32"):
+  if not platform_is("win32", bld.env):
     node.source += " src/node_signal_watcher.cc "
     node.source += " src/node_stat_watcher.cc "
     node.source += " src/node_io_watcher.cc "
@@ -913,7 +933,7 @@ def build(bld):
   if os.environ.has_key('RPATH'):
     node.rpath = os.environ['RPATH']
 
-  if (sys.platform.startswith("win32")):
+  if platform_is("win32", bld.env):
     # Static libgcc
     bld.env.append_value('LINKFLAGS', '-static-libgcc')
     bld.env.append_value('LINKFLAGS', '-static-libstdc++')
@@ -959,7 +979,7 @@ def build(bld):
   # Only install the man page if it exists.
   # Do 'make doc install' to build and install it.
   if os.path.exists('doc/node.1'):
-    prefix = 'bsd' in sys.platform and '${PREFIX}' or '${PREFIX}/share'
+    prefix = platform_is("bsd", bld.env, True) and '${PREFIX}' or '${PREFIX}/share'
     bld.install_files(prefix + '/man/man1/', 'doc/node.1')
 
   bld.install_files('${PREFIX}/bin/', 'tools/node-waf', chmod=0755)
@@ -979,6 +999,7 @@ def shutdown():
       print "WARNING: Platform not fully supported. Using src/platform_none.cc"
 
   elif not Options.commands['clean']:
+    # TODO: Use is_platform and envrionment to allow make clean to work when cross compiling
     if sys.platform.startswith("win32"):
       if os.path.exists('out/Release/node.exe'):
         os.system('cp out/Release/node.exe .')
