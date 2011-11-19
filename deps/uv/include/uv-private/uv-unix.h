@@ -34,6 +34,7 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <termios.h>
+#include <pthread.h>
 
 /* Note: May be cast to struct iovec. See writev(2). */
 typedef struct {
@@ -42,6 +43,9 @@ typedef struct {
 } uv_buf_t;
 
 typedef int uv_file;
+
+typedef pthread_mutex_t uv_mutex_t;
+typedef pthread_rwlock_t uv_rwlock_t;
 
 /* Platform-specific definitions for uv_dlopen support. */
 typedef void* uv_lib_t;
@@ -204,10 +208,14 @@ typedef void* uv_lib_t;
 #include <sys/port.h>
 #include <port.h>
 
-#define UV_FS_EVENT_PRIVATE_FIELDS \
+#ifdef PORT_SOURCE_FILE
+# define UV_FS_EVENT_PRIVATE_FIELDS \
   ev_io event_watcher; \
   uv_fs_event_cb cb; \
-  file_obj_t fo; \
+  file_obj_t fo;
+#else /* !PORT_SOURCE_FILE */
+# define UV_FS_EVENT_PRIVATE_FIELDS
+#endif
 
 #else
 
