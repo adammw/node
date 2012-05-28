@@ -978,7 +978,7 @@ void FloatingPointHelper::CallCCodeForDoubleOperation(
   __ push(lr);
   __ PrepareCallCFunction(0, 2, scratch);
   if (masm->use_eabi_hardfloat()) {
-    CpuFeatures::Scope scope(VFP3);
+    CpuFeatures::Scope scope(VFP2);
     __ vmov(d0, r0, r1);
     __ vmov(d1, r2, r3);
   }
@@ -990,7 +990,7 @@ void FloatingPointHelper::CallCCodeForDoubleOperation(
   // Store answer in the overwritable heap number. Double returned in
   // registers r0 and r1 or in d0.
   if (masm->use_eabi_hardfloat()) {
-    CpuFeatures::Scope scope(VFP3);
+    CpuFeatures::Scope scope(VFP2);
     __ vstr(d0,
             FieldMemOperand(heap_number_result, HeapNumber::kValueOffset));
   } else {
@@ -1362,7 +1362,7 @@ static void EmitTwoNonNanDoubleComparison(MacroAssembler* masm,
     __ push(lr);
     __ PrepareCallCFunction(0, 2, r5);
     if (masm->use_eabi_hardfloat()) {
-      CpuFeatures::Scope scope(VFP3);
+      CpuFeatures::Scope scope(VFP2);
       __ vmov(d0, r0, r1);
       __ vmov(d1, r2, r3);
     }
@@ -3389,7 +3389,7 @@ void TranscendentalCacheStub::GenerateCallCFunction(MacroAssembler* masm,
 
   __ push(lr);
   __ PrepareCallCFunction(0, 1, scratch);
-  if (masm->use_eabi_hardfloat()) {
+  if (masm->use_eabi_hardfloat() && CpuFeatures::IsSupported(VFP3)) {
     __ vmov(d0, d2);
   } else {
     __ vmov(r0, r1, d2);

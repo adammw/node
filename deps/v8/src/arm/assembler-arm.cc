@@ -52,7 +52,7 @@ unsigned CpuFeatures::found_by_runtime_probing_ = 0;
 
 
 // Get the CPU features enabled by the build. For cross compilation the
-// preprocessor symbols CAN_USE_ARMV7_INSTRUCTIONS and CAN_USE_VFP_INSTRUCTIONS
+// preprocessor symbols CAN_USE_ARMV7_INSTRUCTIONS and CAN_USE_VFP3_INSTRUCTIONS
 // can be defined to enable ARMv7 and VFPv3 instructions when building the
 // snapshot.
 static uint64_t CpuFeaturesImpliedByCompiler() {
@@ -60,9 +60,12 @@ static uint64_t CpuFeaturesImpliedByCompiler() {
 #ifdef CAN_USE_ARMV7_INSTRUCTIONS
   answer |= 1u << ARMv7;
 #endif  // def CAN_USE_ARMV7_INSTRUCTIONS
-#ifdef CAN_USE_VFP_INSTRUCTIONS
-  answer |= 1u << VFP3 | 1u << ARMv7;
-#endif  // def CAN_USE_VFP_INSTRUCTIONS
+#ifdef CAN_USE_VFP3_INSTRUCTIONS
+  answer |= 1u << VFP3 | 1u << VFP2 | 1u << ARMv7;
+#endif  // def CAN_USE_VFP3_INSTRUCTIONS
+#ifdef CAN_USE_VFP2_INSTRUCTIONS
+  answer |= 1u << VFP2;
+#endif // def CAN_USE_VFP2_INSTRUCTIONS
 
 #ifdef __arm__
   // If the compiler is allowed to use VFP then we can use VFP too in our code
@@ -1742,7 +1745,7 @@ void Assembler::vstr(const DwVfpRegister src,
   // Instruction details available in ARM DDI 0406A, A8-786.
   // cond(31-28) | 1101(27-24)| U000(23-20) | | Rbase(19-16) |
   // Vsrc(15-12) | 1011(11-8) | (offset/4)
-  ASSERT(CpuFeatures::IsEnabled(VFP3));
+  ASSERT(CpuFeatures::IsEnabled(VFP3) || CpuFeatures::IsEnabled(VFP2));
   int u = 1;
   if (offset < 0) {
     offset = -offset;
@@ -2028,7 +2031,7 @@ void Assembler::vmov(const DwVfpRegister dst,
   // Instruction details available in ARM DDI 0406A, A8-646.
   // cond(31-28) | 1100(27-24)| 010(23-21) | op=0(20) | Rt2(19-16) |
   // Rt(15-12) | 1011(11-8) | 00(7-6) | M(5) | 1(4) | Vm
-  ASSERT(CpuFeatures::IsEnabled(VFP3));
+  ASSERT(CpuFeatures::IsEnabled(VFP3) || CpuFeatures::IsEnabled(VFP2));
   ASSERT(!src1.is(pc) && !src2.is(pc));
   emit(cond | 0xC*B24 | B22 | src2.code()*B16 |
        src1.code()*B12 | 0xB*B8 | B4 | dst.code());

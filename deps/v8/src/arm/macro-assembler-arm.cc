@@ -930,7 +930,7 @@ void MacroAssembler::LeaveExitFrame(bool save_doubles,
 }
 
 void MacroAssembler::GetCFunctionDoubleResult(const DoubleRegister dst) {
-  if (use_eabi_hardfloat()) {
+  if (use_eabi_hardfloat() && CpuFeatures::IsSupported(VFP3)) {
     Move(dst, d0);
   } else {
     vmov(dst, r0, r1);
@@ -3332,7 +3332,7 @@ void MacroAssembler::PrepareCallCFunction(int num_reg_arguments,
 
 
 void MacroAssembler::SetCallCDoubleArguments(DoubleRegister dreg) {
-  if (use_eabi_hardfloat()) {
+  if (use_eabi_hardfloat() && CpuFeatures::IsSupported(VFP3)) {
     Move(d0, dreg);
   } else {
     vmov(r0, r1, dreg);
@@ -3342,7 +3342,7 @@ void MacroAssembler::SetCallCDoubleArguments(DoubleRegister dreg) {
 
 void MacroAssembler::SetCallCDoubleArguments(DoubleRegister dreg1,
                                              DoubleRegister dreg2) {
-  if (use_eabi_hardfloat()) {
+  if (use_eabi_hardfloat() && CpuFeatures::IsSupported(VFP3)) {
     if (dreg2.is(d0)) {
       ASSERT(!dreg1.is(d1));
       Move(d1, dreg2);
@@ -3360,7 +3360,7 @@ void MacroAssembler::SetCallCDoubleArguments(DoubleRegister dreg1,
 
 void MacroAssembler::SetCallCDoubleArguments(DoubleRegister dreg,
                                              Register reg) {
-  if (use_eabi_hardfloat()) {
+  if (use_eabi_hardfloat() && CpuFeatures::IsSupported(VFP3)) {
     Move(d0, dreg);
     Move(r0, reg);
   } else {
