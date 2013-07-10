@@ -7,7 +7,8 @@ import shlex
 import subprocess
 import sys
 
-CC = os.environ.get('CC', 'cc')
+HOSTCC = os.environ.get('CC', 'cc')
+TARGETCC = HOSTCC
 
 root_dir = os.path.dirname(__file__)
 sys.path.insert(0, os.path.join(root_dir, 'tools', 'gyp', 'pylib'))
@@ -228,6 +229,14 @@ parser.add_option("--gdb",
     dest="gdb",
     help="add gdb support")
 
+# This option should really be called host to follow the lead of autoconf
+# (ref: http://jingfenghanmax.blogspot.co.uk/2010/09/configure-with-host-target-and-build.html)
+# but instead we call it target so as not to confuse the terminology as that's what gyp calls it
+parser.add_option("--target",
+    action="store",
+    dest="target_prefix",
+    help="system tuple to build for. Example: arm-linux-androideabi")
+
 parser.add_option("--dest-cpu",
     action="store",
     dest="dest_cpu",
@@ -290,11 +299,14 @@ def pkg_config(pkg):
   return (libs, cflags)
 
 
-def cc_macros():
+def cc_macros(cc=None):
   """Checks predefined macros using the CC command."""
 
+  if cc is None:
+    cc = TARGETCC
+
   try:
-    p = subprocess.Popen(shlex.split(CC) + ['-dM', '-E', '-'],
+    p = subprocess.Popen(shlex.split(cc) + ['-dM', '-E', '-'],
                          stdin=subprocess.PIPE,
                          stdout=subprocess.PIPE,
                          stderr=subprocess.PIPE)
@@ -346,15 +358,17 @@ def is_arm_hard_float_abi():
   # GCC versions 4.5 may support hard-fp without defining __ARM_PCS or
   # __ARM_PCS_VFP.
 
+  cc_macros_cache = cc_macros()
+
   if compiler_version() >= (4, 6, 0):
-    return '__ARM_PCS_VFP' in cc_macros()
+    return '__ARM_PCS_VFP' in cc_macros_cache
   elif compiler_version() < (4, 5, 0):
     return False
-  elif '__ARM_PCS_VFP' in cc_macros():
+  elif '__ARM_PCS_VFP' in cc_macros_cache:
     return True
-  elif ('__ARM_PCS' in cc_macros() or
-        '__SOFTFP' in cc_macros() or
-        not '__VFP_FP__' in cc_macros()):
+  elif ('__ARM_PCS' in cc_macros_cache or
+        '__SOFTFP' in cc_macros_cache or
+        not '__VFP_FP__' in cc_macros_cache):
     return False
   else:
     print '''Node.js configure error: Your version of GCC does not report
@@ -366,10 +380,10 @@ def is_arm_hard_float_abi():
     sys.exit()
 
 
-def host_arch_cc():
-  """Host architecture check using the CC command."""
+def arch_cc(cc=None):
+  """Architecture check using the CC command."""
 
-  k = cc_macros()
+  k = cc_macros(cc)
 
   matchup = {
     '__x86_64__'  : 'x64',
@@ -403,15 +417,19 @@ def host_arch_win():
   return matchup.get(arch, 'ia32')
 
 
-def compiler_version():
+def compiler_version(cc=None):
+
+  if cc is None:
+    cc = TARGETCC
+
   try:
-    proc = subprocess.Popen(shlex.split(CC) + ['--version'], stdout=subprocess.PIPE)
+    proc = subprocess.Popen(shlex.split(cc) + ['--version'], stdout=subprocess.PIPE)
   except WindowsError:
     return (0, False)
 
   is_clang = 'clang' in proc.communicate()[0].split('\n')[0]
 
-  proc = subprocess.Popen(shlex.split(CC) + ['-dumpversion'], stdout=subprocess.PIPE)
+  proc = subprocess.Popen(shlex.split(cc) + ['-dumpversion'], stdout=subprocess.PIPE)
   version = tuple(map(int, proc.communicate()[0].split('.')))
 
   return (version, is_clang)
@@ -430,16 +448,18 @@ def configure_arm(o):
 
 
 def configure_node(o):
-  if options.dest_os == 'android':
-    o['variables']['OS'] = "android"
+  if dest_os:
+    o['variables']['OS'] = dest_os
+
   o['variables']['v8_enable_gdbjit'] = 1 if options.gdb else 0
   o['variables']['v8_no_strict_aliasing'] = 1 # work around compiler bugs
   o['variables']['node_prefix'] = os.path.expanduser(options.prefix or '')
   o['variables']['node_install_npm'] = b(not options.without_npm)
   o['default_configuration'] = 'Debug' if options.debug else 'Release'
 
-  host_arch = host_arch_win() if os.name == 'nt' else host_arch_cc()
-  target_arch = options.dest_cpu or host_arch
+  host_arch = host_arch_win() if os.name == 'nt' else arch_cc(HOSTCC)
+  # TODO: support auto-detecting cross-compiling on windows
+  target_arch = dest_cpu or host_arch if os.name == 'nt' else arch_cc()
   o['variables']['host_arch'] = host_arch
   o['variables']['target_arch'] = target_arch
 
@@ -459,11 +479,11 @@ def configure_node(o):
   # By default, enable DTrace on SunOS systems. Don't allow it on other
   # systems, since it won't work.  (The MacOS build process is different than
   # SunOS, and we haven't implemented it.)
-  if flavor in ('solaris', 'mac'):
+  if target_flavor in ('solaris', 'mac'):
     o['variables']['node_use_dtrace'] = b(not options.without_dtrace)
     o['variables']['uv_use_dtrace'] = o['variables']['node_use_dtrace']
     o['variables']['uv_parent_path'] = '/deps/uv/'
-  elif flavor == 'linux':
+  elif target_flavor == 'linux':
     o['variables']['node_use_dtrace'] = 'false'
     o['variables']['node_use_systemtap'] = b(options.with_dtrace)
     if options.systemtap_includes:
@@ -479,7 +499,7 @@ def configure_node(o):
     o['defines'] += ['SUNOS_NO_IFADDRS']
 
   # By default, enable ETW on Windows.
-  if flavor == 'win':
+  if target_flavor == 'win':
     o['variables']['node_use_etw'] = b(not options.without_etw);
   elif options.with_etw:
     raise Exception('ETW is only supported on Windows.')
@@ -487,7 +507,7 @@ def configure_node(o):
     o['variables']['node_use_etw'] = 'false'
 
   # By default, enable Performance counters on Windows.
-  if flavor == 'win':
+  if target_flavor == 'win':
     o['variables']['node_use_perfctr'] = b(not options.without_perfctr);
   elif options.with_perfctr:
     raise Exception('Performance counter is only supported on Windows.')
@@ -557,7 +577,8 @@ def configure_libuv(o):
 
 
 def configure_v8(o):
-  o['variables']['v8_use_snapshot'] = b(not options.without_snapshot)
+  cross_compiling = (o['variables']['host_arch'] != o['variables']['target_arch'])
+  o['variables']['v8_use_snapshot'] = b(not options.without_snapshot and not cross_compiling)
   o['variables']['node_shared_v8'] = b(options.shared_v8)
 
   # assume shared_v8 if one of these is set?
@@ -600,7 +621,7 @@ def configure_openssl(o):
 
 
 def configure_winsdk(o):
-  if flavor != 'win':
+  if target_flavor != 'win':
     return
 
   winsdk_dir = os.environ.get("WindowsSdkDir")
@@ -613,12 +634,52 @@ def configure_winsdk(o):
   print "ctrpp not found in WinSDK path--using pre-gen files from tools/msvs/genfiles."
 
 
+def parse_target_triplet(triplet):
+  cpu = triplet.split('-',1)[0]
+  os = None
+  # android must be before linux as the host triplet arm-linux-androideabi contains both
+  valid_os = ['win', 'mac', 'solaris', 'freebsd', 'openbsd', 'android', 'linux']
+  for check_os in valid_os:
+    if check_os in triplet:
+      os = check_os
+      break
+  return (cpu, os)
+
+dest_cpu = None
+dest_os = None
+
+if (options.target_prefix):
+  # Change CC, AR, CXX, LINK to target-prefixed versions if not specifed
+  if 'CC' in os.environ:
+    TARGETCC = os.environ['CC']
+  else:
+    TARGETCC = os.environ['CC'] = '%s-gcc' % options.target_prefix  
+  if not 'AR' in os.environ:
+    os.environ['AR'] = '%s-ar' % options.target_prefix
+  if not 'CXX' in os.environ:
+    os.environ['CXX'] = '%s-c++' % options.target_prefix
+  if not 'LINK' in os.environ:
+    os.environ['LINK'] = os.environ['CXX']
+
+  # Reset HOSTCC (no longer known unless CC_host is set, guess 'cc')
+  HOSTCC = os.environ['CC_host'] if 'CC_host' in os.environ else 'cc'
+
+  # Update dest_cpu and dest_os from triplet
+  (dest_cpu, dest_os) = parse_target_triplet(options.target_prefix)
+
+# overrides / legacy fallback
+if (options.dest_cpu):
+  dest_cpu = options.dest_cpu
+if (options.dest_os):
+  dest_os = options.dest_os
+
 # determine the "flavor" (operating system) we're building for,
 # leveraging gyp's GetFlavor function
 flavor_params = {};
-if (options.dest_os):
-  flavor_params['flavor'] = options.dest_os;
-flavor = GetFlavor(flavor_params);
+if (dest_os):
+  flavor_params['flavor'] = dest_os;
+target_flavor = GetFlavor(flavor_params);
+host_flavor = GetFlavor({});
 
 output = {
   'variables': { 'python': sys.executable },
@@ -673,12 +734,12 @@ write('config.mk',
       '# Do not edit. Generated by the configure script.\n' + config)
 
 if options.use_ninja:
-  gyp_args = ['-f', 'ninja-' + flavor]
+  gyp_args = ['-f', 'ninja-' + host_flavor]
 elif options.use_xcode:
   gyp_args = ['-f', 'xcode']
-elif flavor == 'win':
+elif host_flavor == 'win':
   gyp_args = ['-f', 'msvs', '-G', 'msvs_version=auto']
 else:
-  gyp_args = ['-f', 'make-' + flavor]
+  gyp_args = ['-f', 'make-' + host_flavor]
 
 subprocess.call([sys.executable, 'tools/gyp_node'] + gyp_args)
